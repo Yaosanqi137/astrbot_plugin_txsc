@@ -76,8 +76,23 @@
   },
   "tongyi_model": {
     "type": "string",
-    "default": "wan2.2-t2i-flash",
-    "description": "通义万相模型名称"
+    "default": "wan2.6-t2i-flash",
+    "description": "通义万相文生图模型名称"
+  },
+  "tongyi_i2i_model": {
+    "type": "string",
+    "default": "wan2.6-i2i",
+    "description": "通义万相图生图模型名称"
+  },
+  "tongyi_i2i_base_url": {
+    "type": "string",
+    "default": "https://dashscope.aliyuncs.com/api/v1/services/aigc/image-generation/generation",
+    "description": "通义万相图生图API基础URL"
+  },
+  "image_edit_timeout": {
+    "type": "int",
+    "default": 30,
+    "description": "图片编辑会话超时时间（秒）"
   },
   "volcengine_api_key": {
     "type": "string",

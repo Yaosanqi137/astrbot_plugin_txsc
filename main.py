@@ -14,6 +14,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Plain, Image
 
 from .providers.base import BaseProvider, GenerationConfig, ImageGenerationResult
+from .providers.tongyi import TongyiProvider
 
 
 @register(
@@ -28,11 +29,13 @@ class UniversalTextToImagePlugin(Star):
         self.config = config or {}
         self.providers: Dict[str, BaseProvider] = {}
         self.active_providers: List[str] = []
-        
+
         self.plugin_name = "通用文生图插件"
         self.plugin_description = "支持多家供应商的文生图功能"
         self.plugin_version = "1.0.0"
-        
+
+        self.pending_image_edit_sessions: Dict[str, Dict[str, Any]] = {}
+
         logger.info("初始化通用文生图插件")
         self._load_providers()
         self._initialize_providers()
@@ -104,7 +107,9 @@ class UniversalTextToImagePlugin(Star):
                 config = {
                     'api_key': api_key,
                     'base_url': self.config.get('tongyi_base_url'),
-                    'model': self.config.get('tongyi_model')
+                    'model': self.config.get('tongyi_model'),
+                    'i2i_model': self.config.get('tongyi_i2i_model'),
+                    'i2i_base_url': self.config.get('tongyi_i2i_base_url')
                 }
         elif prefix == 'volcengine':
             api_key = self.config.get('volcengine_api_key', '')
@@ -185,6 +190,125 @@ class UniversalTextToImagePlugin(Star):
         """使用科大讯飞生成图片"""
         async for result in self._handle_image_generation(event, "xunfei"):
             yield result
+
+    @filter.command("iti", alias={"图编辑"})
+    async def image_to_image_command(self, event: AstrMessageEvent):
+        """图片编辑命令"""
+        args = event.message_str.strip().split(maxsplit=1)
+        if len(args) < 2:
+            yield event.plain_result("请提供编辑描述文字。\n使用示例: /iti 将图1中的闹钟放置到图2的餐桌的花瓶旁边位置")
+            return
+
+        prompt = args[1].strip()
+        user_id = event.unified_msg_origin
+
+        timeout = self.config.get("image_edit_timeout", 30)
+
+        self.pending_image_edit_sessions[user_id] = {
+            "prompt": prompt,
+            "images": [],
+            "start_time": asyncio.get_event_loop().time()
+        }
+
+        yield event.plain_result(f"请发送图片，发送完毕请发送“完成”。\n超时时间: {timeout}秒")
+
+    @filter.message_type("message")
+    async def handle_image_edit_images(self, event: AstrMessageEvent):
+        """处理图片编辑会话中的图片输入"""
+        user_id = event.unified_msg_origin
+
+        if user_id not in self.pending_image_edit_sessions:
+            return
+
+        session = self.pending_image_edit_sessions[user_id]
+        timeout = self.config.get("image_edit_timeout", 30)
+
+        if asyncio.get_event_loop().time() - session["start_time"] > timeout:
+            del self.pending_image_edit_sessions[user_id]
+            yield event.plain_result("图片编辑会话已超时，请重新开始")
+            return
+
+        message_str = event.message_str.strip()
+
+        if message_str == "完成":
+            if len(session["images"]) == 0:
+                del self.pending_image_edit_sessions[user_id]
+                yield event.plain_result("未收到任何图片，操作已取消")
+                return
+
+            images = session["images"]
+            prompt = session["prompt"]
+            del self.pending_image_edit_sessions[user_id]
+
+            yield event.plain_result(f"收到 {len(images)} 张图片，正在生成编辑后的图片...")
+
+            async for result in self._handle_image_edit_generation(event, prompt, images):
+                yield result
+            return
+
+        image_components = [comp for comp in event.message_obj if isinstance(comp, Image)]
+
+        if image_components:
+            for img in image_components:
+                if len(session["images"]) >= 3:
+                    yield event.plain_result("最多支持3张图片，已忽略额外的图片")
+                    break
+
+                image_url = None
+                if hasattr(img, 'url') and img.url:
+                    image_url = img.url
+                elif hasattr(img, 'file') and img.file:
+                    with open(img.file, 'rb') as f:
+                        image_data = f.read()
+                        image_base64 = base64.b64encode(image_data).decode('utf-8')
+                        image_url = f"data:image/png;base64,{image_base64}"
+
+                if image_url:
+                    session["images"].append(image_url)
+
+            yield event.plain_result(f"已收到 {len(session['images'])} 张图片，继续发送图片或发送“完成”结束")
+        else:
+            yield event.plain_result("请发送图片或输入“完成”")
+
+    async def _handle_image_edit_generation(self, event: AstrMessageEvent, prompt: str, images: List[str]):
+        """处理图片编辑生成"""
+        if 'tongyi' not in self.active_providers:
+            yield event.plain_result("图片编辑功能需要配置通义万相API")
+            return
+
+        tongyi_provider = self.providers.get('tongyi')
+        if not isinstance(tongyi_provider, TongyiProvider):
+            yield event.plain_result("图片编辑功能仅支持通义万相")
+            return
+
+        try:
+            result = await tongyi_provider.generate_image_edit(prompt, images)
+
+            if result.success and result.has_image:
+                if result.image_url:
+                    yield event.image_result(result.image_url)
+                elif result.image_base64:
+                    tmp_file_path = None
+                    try:
+                        image_data = base64.b64decode(result.image_base64)
+
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                            tmp_file.write(image_data)
+                            tmp_file_path = tmp_file.name
+
+                        yield event.image_result(tmp_file_path)
+                    except Exception as e:
+                        logger.error(f"处理base64图片并发送时出错: {e}")
+                        yield event.plain_result("图片已生成,但在发送时遇到问题。")
+                    finally:
+                        if tmp_file_path and os.path.exists(tmp_file_path):
+                            os.remove(tmp_file_path)
+            else:
+                error_msg = result.error_message or "生成图片失败"
+                yield event.plain_result(f"生成失败: {error_msg}")
+        except Exception as e:
+            logger.error(f"图片编辑异常: {e}")
+            yield event.plain_result(f"图片编辑失败: {str(e)}")
     
     async def _handle_image_generation(self, event: AstrMessageEvent, specific_provider: str = None):
         """统一的图像生成处理方法"""
@@ -312,9 +436,11 @@ class UniversalTextToImagePlugin(Star):
 /tti 一只可爱的橘色小猫咪，坐在阳光明媚的窗台上
 /tti-tongyi 科技感的未来城市夜景，霓虹灯闪烁
 /tti-huoshan 美丽的山水风景画，中国风格
+/iti 将图1中的闹钟放置到图2的餐桌的花瓶旁边位置
 
 ⚠️ 注意事项:
 • PPIO使用异步任务机制，生成时间较长（30秒-2分钟）
+• 图片编辑功能需要配置通义万相API
 • 请确保账户余额充足
 
 📖 完整文档请参阅插件README.md
