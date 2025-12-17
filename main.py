@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
@@ -12,6 +13,7 @@ from astrbot.api import logger
 from astrbot.api.star import Star, Context, register
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Plain, Image
+from astrbot.core.utils.session_waiter import session_waiter, SessionController
 
 from .providers.base import BaseProvider, GenerationConfig, ImageGenerationResult
 from .providers.tongyi import TongyiProvider
@@ -34,7 +36,7 @@ class UniversalTextToImagePlugin(Star):
         self.plugin_description = "支持多家供应商的文生图功能"
         self.plugin_version = "1.0.0"
 
-        self.pending_image_edit_sessions: Dict[str, Dict[str, Any]] = {}
+        self.user_last_request_time: Dict[str, float] = {}
 
         logger.info("初始化通用文生图插件")
         self._load_providers()
@@ -149,9 +151,60 @@ class UniversalTextToImagePlugin(Star):
         else:
             logger.info(f"已启用 {len(self.active_providers)} 个供应商: {', '.join(self.active_providers)}")
 
+    def _check_cooldown(self, event: AstrMessageEvent) -> Optional[str]:
+        """检查用户冷却时间，返回None表示通过，返回错误消息表示需要冷却"""
+        cooldown_time = self.config.get("cooldown_time", 180)
+        logger.info(f"冷却检查: cooldown_time={cooldown_time}")
+
+        if cooldown_time <= 0:
+            logger.info("冷却时间<=0，跳过检查")
+            return None
+
+        try:
+            admins = self.context.config_helper.get("admins_id", [])
+            user_id = event.unified_msg_origin
+            logger.info(f"管理员列表: {admins}, 用户ID: {user_id}")
+
+            if user_id in admins:
+                logger.info(f"用户 {user_id} 是管理员，跳过冷却检查")
+                return None
+        except Exception as e:
+            logger.warning(f"检查管理员权限时出错: {e}")
+
+        user_id = event.unified_msg_origin
+        current_time = time.time()
+        logger.info(f"用户ID: {user_id}, 当前时间: {current_time}")
+
+        if user_id in self.user_last_request_time:
+            last_time = self.user_last_request_time[user_id]
+            elapsed = current_time - last_time
+            logger.info(f"上次请求时间: {last_time}, 已过时间: {elapsed}秒")
+
+            if elapsed < cooldown_time:
+                remaining = int(cooldown_time - elapsed)
+                minutes = remaining // 60
+                seconds = remaining % 60
+                logger.info(f"冷却中，剩余: {remaining}秒")
+                if minutes > 0:
+                    return f"请求冷却中，请 {minutes} 分 {seconds} 秒后再试"
+                else:
+                    return f"请求冷却中，请 {seconds} 秒后再试"
+        else:
+            logger.info("首次请求，无冷却")
+
+        self.user_last_request_time[user_id] = current_time
+        logger.info(f"更新用户 {user_id} 的最后请求时间为 {current_time}")
+        return None
+
+
     @filter.command("tti", alias={"文生图"})
     async def text_to_image_command(self, event: AstrMessageEvent):
         """文生图命令"""
+        cooldown_msg = self._check_cooldown(event)
+        if cooldown_msg:
+            yield event.plain_result(cooldown_msg)
+            return
+
         async for result in self._handle_image_generation(event, None):
             yield result
     
@@ -193,82 +246,82 @@ class UniversalTextToImagePlugin(Star):
 
     @filter.command("iti", alias={"图编辑"})
     async def image_to_image_command(self, event: AstrMessageEvent):
-        """图片编辑命令"""
+        cooldown_msg = self._check_cooldown(event)
+        if cooldown_msg:
+            yield event.plain_result(cooldown_msg)
+            return
+
         args = event.message_str.strip().split(maxsplit=1)
         if len(args) < 2:
             yield event.plain_result("请提供编辑描述文字。\n使用示例: /iti 将图1中的闹钟放置到图2的餐桌的花瓶旁边位置")
             return
 
         prompt = args[1].strip()
-        user_id = event.unified_msg_origin
-
         timeout = self.config.get("image_edit_timeout", 30)
 
-        self.pending_image_edit_sessions[user_id] = {
-            "prompt": prompt,
-            "images": [],
-            "start_time": asyncio.get_event_loop().time()
-        }
+        yield event.plain_result(f"请发送图片，发送完毕请发送\"完成\"。\n超时时间: {timeout}秒")
 
-        yield event.plain_result(f"请发送图片，发送完毕请发送“完成”。\n超时时间: {timeout}秒")
+        images = []
 
-    @filter.message_type("message")
-    async def handle_image_edit_images(self, event: AstrMessageEvent):
-        """处理图片编辑会话中的图片输入"""
-        user_id = event.unified_msg_origin
+        @session_waiter(timeout=timeout, record_history_chains=False)
+        async def wait_for_images(controller: SessionController, event: AstrMessageEvent):
+            message_str = event.message_str.strip()
 
-        if user_id not in self.pending_image_edit_sessions:
-            return
+            if message_str == "完成":
+                if len(images) == 0:
+                    await event.send(event.plain_result("未收到任何图片，操作已取消"))
+                    controller.stop()
+                    return
 
-        session = self.pending_image_edit_sessions[user_id]
-        timeout = self.config.get("image_edit_timeout", 30)
+                await event.send(event.plain_result(f"收到 {len(images)} 张图片，正在生成编辑后的图片..."))
+                controller.stop()
 
-        if asyncio.get_event_loop().time() - session["start_time"] > timeout:
-            del self.pending_image_edit_sessions[user_id]
-            yield event.plain_result("图片编辑会话已超时，请重新开始")
-            return
-
-        message_str = event.message_str.strip()
-
-        if message_str == "完成":
-            if len(session["images"]) == 0:
-                del self.pending_image_edit_sessions[user_id]
-                yield event.plain_result("未收到任何图片，操作已取消")
+                async for result in self._handle_image_edit_generation(event, prompt, images):
+                    await event.send(result)
                 return
 
-            images = session["images"]
-            prompt = session["prompt"]
-            del self.pending_image_edit_sessions[user_id]
+            image_components = [comp for comp in event.message_obj.message if isinstance(comp, Image)]
 
-            yield event.plain_result(f"收到 {len(images)} 张图片，正在生成编辑后的图片...")
+            if image_components:
+                for img in image_components:
+                    if len(images) >= 3:
+                        await event.send(event.plain_result("最多支持3张图片，已忽略额外的图片"))
+                        break
 
-            async for result in self._handle_image_edit_generation(event, prompt, images):
-                yield result
-            return
+                    try:
+                        if hasattr(img, 'url') and img.url:
+                            import aiohttp
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(img.url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                                    if resp.status == 200:
+                                        image_data = await resp.read()
+                                        image_base64 = base64.b64encode(image_data).decode('utf-8')
+                                        image_url = f"data:image/png;base64,{image_base64}"
+                                        images.append(image_url)
+                                    else:
+                                        logger.error(f"下载图片失败: HTTP {resp.status}")
+                        elif hasattr(img, 'file') and img.file:
+                            with open(img.file, 'rb') as f:
+                                image_data = f.read()
+                                image_base64 = base64.b64encode(image_data).decode('utf-8')
+                                image_url = f"data:image/png;base64,{image_base64}"
+                                images.append(image_url)
+                    except Exception as e:
+                        logger.error(f"处理图片失败: {e}")
+                        continue
 
-        image_components = [comp for comp in event.message_obj if isinstance(comp, Image)]
+                await event.send(event.plain_result(f"已收到 {len(images)} 张图片，继续发送图片或发送\"完成\"结束"))
+            else:
+                await event.send(event.plain_result("请发送图片或输入\"完成\""))
 
-        if image_components:
-            for img in image_components:
-                if len(session["images"]) >= 3:
-                    yield event.plain_result("最多支持3张图片，已忽略额外的图片")
-                    break
+            controller.keep(timeout=timeout, reset_timeout=True)
 
-                image_url = None
-                if hasattr(img, 'url') and img.url:
-                    image_url = img.url
-                elif hasattr(img, 'file') and img.file:
-                    with open(img.file, 'rb') as f:
-                        image_data = f.read()
-                        image_base64 = base64.b64encode(image_data).decode('utf-8')
-                        image_url = f"data:image/png;base64,{image_base64}"
-
-                if image_url:
-                    session["images"].append(image_url)
-
-            yield event.plain_result(f"已收到 {len(session['images'])} 张图片，继续发送图片或发送“完成”结束")
-        else:
-            yield event.plain_result("请发送图片或输入“完成”")
+        try:
+            await wait_for_images(event)
+        except TimeoutError:
+            yield event.plain_result("图片编辑会话已超时，请重新开始")
+        finally:
+            event.stop_event()
 
     async def _handle_image_edit_generation(self, event: AstrMessageEvent, prompt: str, images: List[str]):
         """处理图片编辑生成"""

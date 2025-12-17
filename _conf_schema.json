@@ -71,17 +71,17 @@
   },
   "tongyi_base_url": {
     "type": "string",
-    "default": "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis",
-    "description": "通义万相API基础URL"
+    "default": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    "description": "通义万相文生图API基础URL"
   },
   "tongyi_model": {
     "type": "string",
-    "default": "wan2.6-t2i-flash",
+    "default": "wan2.6-t2i",
     "description": "通义万相文生图模型名称"
   },
   "tongyi_i2i_model": {
     "type": "string",
-    "default": "wan2.6-i2i",
+    "default": "wan2.6-image",
     "description": "通义万相图生图模型名称"
   },
   "tongyi_i2i_base_url": {
@@ -93,6 +93,11 @@
     "type": "int",
     "default": 30,
     "description": "图片编辑会话超时时间（秒）"
+  },
+  "cooldown_time": {
+    "type": "int",
+    "default": 180,
+    "description": "用户请求冷却时间（秒），管理员无视冷却，设为0禁用冷却"
   },
   "volcengine_api_key": {
     "type": "string",

@@ -14,7 +14,7 @@ class TongyiProvider(BaseProvider):
     
     @property
     def default_model(self) -> str:
-        return "wanx-2.2"
+        return "wan2.6-t2i"
     
     def validate_config(self) -> bool:
         api_key = self.get_config_value("api_key")
@@ -22,31 +22,47 @@ class TongyiProvider(BaseProvider):
     
     async def generate_image(self, config: GenerationConfig) -> ImageGenerationResult:
         api_key = self.get_config_value("api_key")
-        base_url = self.get_config_value("base_url", "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis")
+        base_url = self.get_config_value("base_url", "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation")
         model = config.model or self.get_config_value("model", self.default_model)
 
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "X-DashScope-Async": "enable"
+            "Content-Type": "application/json"
         }
 
         size = self._map_size(config.width, config.height)
 
+        parameters = {
+            "size": size,
+            "n": 1,
+            "prompt_extend": True,
+            "watermark": False
+        }
+
+        seed = self.get_config_value("seed")
+        if seed is not None:
+            parameters["seed"] = seed
+
+        negative_prompt = self.get_config_value("negative_prompt")
+        if negative_prompt:
+            parameters["negative_prompt"] = negative_prompt
+
         data = {
             "model": model,
             "input": {
-                "prompt": config.prompt
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "text": config.prompt
+                            }
+                        ]
+                    }
+                ]
             },
-            "parameters": {
-                "size": size,
-                "n": 1,
-                "seed": self.get_config_value("seed"),
-                "style": config.style
-            }
+            "parameters": parameters
         }
-
-        data["parameters"] = {k: v for k, v in data["parameters"].items() if v is not None}
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -58,18 +74,21 @@ class TongyiProvider(BaseProvider):
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        if "output" in result and "results" in result["output"]:
-                            image_url = result["output"]["results"][0]["url"]
-                            return ImageGenerationResult(
-                                success=True,
-                                image_url=image_url
-                            )
-                        else:
-                            error_msg = result.get("message", "未知错误")
-                            return ImageGenerationResult(
-                                success=False,
-                                error_message=f"通义万相API错误: {error_msg}"
-                            )
+                        if "output" in result and "choices" in result["output"]:
+                            choices = result["output"]["choices"]
+                            if len(choices) > 0 and "message" in choices[0]:
+                                content = choices[0]["message"].get("content", [])
+                                if len(content) > 0 and "image" in content[0]:
+                                    image_url = content[0]["image"]
+                                    return ImageGenerationResult(
+                                        success=True,
+                                        image_url=image_url
+                                    )
+                        error_msg = result.get("message", "未知错误")
+                        return ImageGenerationResult(
+                            success=False,
+                            error_message=f"通义万相API错误: {error_msg}"
+                        )
                     else:
                         error_text = await response.text()
                         try:
@@ -90,7 +109,7 @@ class TongyiProvider(BaseProvider):
     async def generate_image_edit(self, prompt: str, images: List[str], negative_prompt: Optional[str] = None) -> ImageGenerationResult:
         api_key = self.get_config_value("api_key")
         base_url = self.get_config_value("i2i_base_url", "https://dashscope.aliyuncs.com/api/v1/services/aigc/image-generation/generation")
-        model = self.get_config_value("i2i_model", "wan2.6-i2i")
+        model = self.get_config_value("i2i_model", "wan2.6-image")
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -107,11 +126,19 @@ class TongyiProvider(BaseProvider):
         if negative_prompt:
             parameters["negative_prompt"] = negative_prompt
 
+        content = [{"text": prompt}]
+        for image in images:
+            content.append({"image": image})
+
         data = {
             "model": model,
             "input": {
-                "prompt": prompt,
-                "images": images
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": content
+                    }
+                ]
             },
             "parameters": parameters
         }
@@ -183,17 +210,20 @@ class TongyiProvider(BaseProvider):
                     task_status = result["output"].get("task_status")
 
                     if task_status == "SUCCEEDED":
-                        if "results" in result["output"] and len(result["output"]["results"]) > 0:
-                            image_url = result["output"]["results"][0]["url"]
-                            return ImageGenerationResult(
-                                success=True,
-                                image_url=image_url
-                            )
-                        else:
-                            return ImageGenerationResult(
-                                success=False,
-                                error_message="任务完成但未返回图片"
-                            )
+                        if "choices" in result["output"] and len(result["output"]["choices"]) > 0:
+                            choices = result["output"]["choices"]
+                            if "message" in choices[0]:
+                                content = choices[0]["message"].get("content", [])
+                                if len(content) > 0 and "image" in content[0]:
+                                    image_url = content[0]["image"]
+                                    return ImageGenerationResult(
+                                        success=True,
+                                        image_url=image_url
+                                    )
+                        return ImageGenerationResult(
+                            success=False,
+                            error_message="任务完成但未返回图片"
+                        )
                     elif task_status == "FAILED":
                         error_msg = result["output"].get("message", "任务失败")
                         return ImageGenerationResult(
@@ -215,13 +245,21 @@ class TongyiProvider(BaseProvider):
     def _map_size(self, width: int, height: int) -> str:
         """映射尺寸到通义万相支持的格式"""
         if width == height:
-            if width <= 512:
-                return "512*512"
-            elif width <= 768:
+            if width <= 768:
                 return "768*768"
-            else:
+            elif width <= 1024:
                 return "1024*1024"
+            else:
+                return "1280*1280"
         elif width > height:
-            return "1280*720"
+            ratio = width / height
+            if ratio >= 16/9:
+                return "1280*720"
+            else:
+                return "1280*960"
         else:
-            return "720*1280"
+            ratio = height / width
+            if ratio >= 16/9:
+                return "720*1280"
+            else:
+                return "960*1280"
